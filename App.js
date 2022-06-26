@@ -1,177 +1,361 @@
-import { StatusBar } from 'expo-status-bar';
-import React, { createRef, useEffect, useState } from 'react';
-import { Image, Platform, StyleSheet, Text, View } from 'react-native';
-import * as tf from '@tensorflow/tfjs';
-import * as mobilenet from '@tensorflow-models/mobilenet';
-import { fetch, decodeJpeg, cameraWithTensors } from '@tensorflow/tfjs-react-native';
-import { Camera } from 'expo-camera';
-import { GLView, ExpoWebGLRenderingContext } from 'expo-gl';
-import Canvas from 'react-native-canvas';
+import React, { useEffect, useState, useRef } from 'react';
+import { StyleSheet, Text, View, Dimensions, Platform } from 'react-native';
 
-const blazeface = require('@tensorflow-models/blazeface');
+import { Camera } from 'expo-camera';
+
+import * as tf from '@tensorflow/tfjs';
+import * as posedetection from '@tensorflow-models/pose-detection';
+import * as ScreenOrientation from 'expo-screen-orientation';
+import {
+  bundleResourceIO,
+  cameraWithTensors,
+} from '@tensorflow/tfjs-react-native';
+import Svg, { Circle } from 'react-native-svg';
+import { ExpoWebGLRenderingContext } from 'expo-gl';
+import { CameraType } from 'expo-camera/build/Camera.types';
+
+// tslint:disable-next-line: variable-name
+const TensorCamera = cameraWithTensors(Camera);
+
+const IS_ANDROID = Platform.OS === 'android';
+const IS_IOS = Platform.OS === 'ios';
+
+// Camera preview size.
+//
+// From experiments, to render camera feed without distortion, 16:9 ratio
+// should be used fo iOS devices and 4:3 ratio should be used for android
+// devices.
+//
+// This might not cover all cases.
+const CAM_PREVIEW_WIDTH = Dimensions.get('window').width;
+const CAM_PREVIEW_HEIGHT = CAM_PREVIEW_WIDTH / (IS_IOS ? 9 / 16 : 3 / 4);
+
+// The score threshold for pose detection results.
+const MIN_KEYPOINT_SCORE = 0.3;
+
+// The size of the resized output from TensorCamera.
+//
+// For movenet, the size here doesn't matter too much because the model will
+// preprocess the input (crop, resize, etc). For best result, use the size that
+// doesn't distort the image.
+const OUTPUT_TENSOR_WIDTH = 180;
+const OUTPUT_TENSOR_HEIGHT = OUTPUT_TENSOR_WIDTH / (IS_IOS ? 9 / 16 : 3 / 4);
+
+// Whether to auto-render TensorCamera preview.
+const AUTO_RENDER = false;
+
+// Whether to load model from app bundle (true) or through network (false).
+const LOAD_MODEL_FROM_BUNDLE = false;
 
 export default function App() {
-  const [isLoading, setIsLoading] = useState(false)
-  const [isTfReady, setIsTfReady] = useState(false);
-  const CAMERA_SIZE = { height: 480, width: 320 };
-  // expo-camera를 통해서 TensorCamera를 구성한다.
-  const TensorCamera = cameraWithTensors(Camera);
+  const cameraRef = useRef(null);
+  const [tfReady, setTfReady] = useState(false);
+  const [model, setModel] = useState();
+  const [poses, setPoses] = useState();
+  const [fps, setFps] = useState(0);
+  const [orientation, setOrientation] =
+    useState();
+  const [cameraType, setCameraType] = useState(
+    Camera.Constants.Type.front
+  );
+  // Use `useRef` so that changing it won't trigger a re-render.
+  //
+  // - null: unset (initial value).
+  // - 0: animation frame/loop has been canceled.
+  // - >0: animation frame has been scheduled.
+  const rafId = useRef(null);
 
-  // TensorCamera의 엘리먼트 정보를 가져온다.
-  const tensorCameraRef = createRef();
-  const canvasRef = createRef();
 
-  // TensorCamera의 미리보기 운영체제 별 너비/높이 지정
-  const textureDims = Platform.OS === "ios" ? { height: 1920, width: 1080 } : { height: 1200, width: 1600 };
+  useEffect(() => {
+    async function prepare() {
+      rafId.current = null;
 
-  const fn_requestPermisison = async () => {
-    const { status } = (await Camera.requestCameraPermissionsAsync())
-    if (status !== 'granted') {
-      console.log("카메라의 권한 요청이 승인 되지 않았습니다.")
-      return;
+      // Set initial orientation.
+      const curOrientation = await ScreenOrientation.getOrientationAsync();
+      setOrientation(curOrientation);
+
+      // Listens to orientation change.
+      ScreenOrientation.addOrientationChangeListener((event) => {
+        setOrientation(event.orientationInfo.orientation);
+      });
+
+      // Camera permission.
+      await Camera.requestCameraPermissionsAsync();
+
+      // Wait for tfjs to initialize the backend.
+      await tf.ready();
+
+      // Load movenet model.
+      // https://github.com/tensorflow/tfjs-models/tree/master/pose-detection
+      const movenetModelConfig = {
+        modelType: posedetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
+        enableSmoothing: true,
+      };
+      if (LOAD_MODEL_FROM_BUNDLE) {
+        const modelJson = require('./offline_model/model.json');
+        const modelWeights1 = require('./offline_model/group1-shard1of2.bin');
+        const modelWeights2 = require('./offline_model/group1-shard2of2.bin');
+        movenetModelConfig.modelUrl = bundleResourceIO(modelJson, [
+          modelWeights1,
+          modelWeights2,
+        ]);
+      }
+      const model = await posedetection.createDetector(
+        posedetection.SupportedModels.MoveNet,
+        movenetModelConfig
+      );
+      setModel(model);
+
+      // Ready!
+      setTfReady(true);
+    }
+
+    prepare();
+  }, []);
+
+  useEffect(() => {
+    // Called when the app is unmounted.
+    return () => {
+      if (rafId.current != null && rafId.current !== 0) {
+        cancelAnimationFrame(rafId.current);
+        rafId.current = 0;
+      }
+    };
+  }, []);
+
+  const handleCameraStream = async (
+    images,
+    updatePreview,
+    gl
+  ) => {
+    const loop = async () => {
+      // Get the tensor and run pose detection.
+      const imageTensor = images.next().value
+
+      const startTs = Date.now();
+      const poses = await model.estimatePoses(
+        imageTensor,
+        undefined,
+        Date.now()
+      );
+      const latency = Date.now() - startTs;
+      setFps(Math.floor(1000 / latency));
+      setPoses(poses);
+      tf.dispose([imageTensor]);
+
+      if (rafId.current === 0) {
+        return;
+      }
+
+      // Render camera preview manually when autorender=false.
+      if (!AUTO_RENDER) {
+        updatePreview();
+        gl.endFrameEXP();
+      }
+
+      rafId.current = requestAnimationFrame(loop);
+    };
+
+    loop();
+  };
+
+  const renderPose = () => {
+    if (poses != null && poses.length > 0) {
+      const keypoints = poses[0].keypoints
+        .filter((k) => (k.score ?? 0) > MIN_KEYPOINT_SCORE)
+        .map((k) => {
+          // Flip horizontally on android or when using back camera on iOS.
+          const flipX = IS_ANDROID || cameraType === Camera.Constants.Type.back;
+          const x = flipX ? getOutputTensorWidth() - k.x : k.x;
+          const y = k.y;
+          const cx =
+            (x / getOutputTensorWidth()) *
+            (isPortrait() ? CAM_PREVIEW_WIDTH : CAM_PREVIEW_HEIGHT);
+          const cy =
+            (y / getOutputTensorHeight()) *
+            (isPortrait() ? CAM_PREVIEW_HEIGHT : CAM_PREVIEW_WIDTH);
+          return (
+            <Circle
+              key={`skeletonkp_${k.name}`}
+              cx={cx}
+              cy={cy}
+              r='4'
+              strokeWidth='2'
+              fill='#00AA00'
+              stroke='white'
+            />
+          );
+        });
+
+      return <Svg style={styles.svg}>{keypoints}</Svg>;
+    } else {
+      return <View></View>;
     }
   };
 
-  const fn_tfReady = async () => {
-    await tf.ready()
-      .then(() => {
-        setIsTfReady(true);
-      })
-      .catch((error) => {
-        console.log("(-) Tensorflow Ready Error ::: ", error);
-        return error;
-      });
-  }
+  const renderFps = () => {
+    return (
+      <View style={styles.fpsContainer}>
+        <Text>FPS: {fps}</Text>
+      </View>
+    );
+  };
 
-  useEffect(() => {
-    (async () => {
-      await fn_requestPermisison();
-      await fn_tfReady();
-    })()
-  }, [])
+  const renderCameraTypeSwitcher = () => {
+    return (
+      <View
+        style={styles.cameraTypeSwitcher}
+        onTouchEnd={handleSwitchCameraType}
+      >
+        <Text>
+          Switch to{' '}
+          {cameraType === Camera.Constants.Type.front ? 'back' : 'front'} camera
+        </Text>
+      </View>
+    );
+  };
 
-  const fn_drawRect = async (predictions) => {
-    const canvas = canvasRef.current;
-    if (canvas) {
-      const ctx = canvas.getContext('2d');
-
-      for (let i = 0; i < predictions.length; i++) {
-        const start = predictions[i].topLeft;
-        const end = predictions[i].bottomRight;
-        const size = [end[0] - start[0], end[1] - start[1]];
-
-        // 그려 줄 캔버스 사이즈 지정
-        canvas.height = CAMERA_SIZE.height;
-        canvas.width = CAMERA_SIZE.width;
-        ctx.strokeStyle = "red"
-        ctx.lineWidth = 6;
-        // 화면상에 Rect를 그려준다.
-        ctx.strokeRect(start[0], start[1], size[0], size[1]);
-      }
+  const handleSwitchCameraType = () => {
+    if (cameraType === Camera.Constants.Type.front) {
+      setCameraType(Camera.Constants.Type.back);
+    } else {
+      setCameraType(Camera.Constants.Type.front);
     }
-  }
+  };
 
-  const fn_estimateBlazeFace = async (tensorImage) => {
+  const isPortrait = () => {
+    return (
+      orientation === ScreenOrientation.Orientation.PORTRAIT_UP ||
+      orientation === ScreenOrientation.Orientation.PORTRAIT_DOWN
+    );
+  };
 
-    // 텐서 이미지가 존재하는지 체크 
-    if (tensorImage) {
+  const getOutputTensorWidth = () => {
+    // On iOS landscape mode, switch width and height of the output tensor to
+    // get better result. Without this, the image stored in the output tensor
+    // would be stretched too much.
+    //
+    // Same for getOutputTensorHeight below.
+    return isPortrait() || IS_ANDROID
+      ? OUTPUT_TENSOR_WIDTH
+      : OUTPUT_TENSOR_HEIGHT;
+  };
 
-      // [기능-1] blazeface 모델을 불러와서 측정을 수행한다
-      const blaze = await blazeface.load();
+  const getOutputTensorHeight = () => {
+    return isPortrait() || IS_ANDROID
+      ? OUTPUT_TENSOR_HEIGHT
+      : OUTPUT_TENSOR_WIDTH;
+  };
 
-      // [기능-2] blazeface 모델을 통하여 사람 얼굴을 측정
-      const predictions = await blaze.estimateFaces(tensorImage, false);
-      console.log(`[+] 측정 얼굴 수 [${predictions.length}]`);
-
-      // [CASE1-1] 얼굴을 예측 한 경우 Canvas에 얼굴을 그려준다.
-      if (predictions.length > 0) {
-        await fn_drawRect(predictions); //조정된 위치에 대해서 캔버스에 그려주기 
-        return true;
-      }
-      // [CASE1-2] 얼굴을 예측하지 못한 경우에 Canvas의 내용을 초기화 한다.
-      else {
-        if (canvasRef.current) canvasRef.current.getContext("2d").clearRect(0, 0, CAMERA_SIZE.width, CAMERA_SIZE.height);
-        return false;
-      }
+  const getTextureRotationAngleInDegrees = () => {
+    // On Android, the camera texture will rotate behind the scene as the phone
+    // changes orientation, so we don't need to rotate it in TensorCamera.
+    if (IS_ANDROID) {
+      return 0;
     }
-    // 텐서 이미지가 존재하지 않는 경우 
-    else {
-      return false;
+
+    // For iOS, the camera texture won't rotate automatically. Calculate the
+    // rotation angles here which will be passed to TensorCamera to rotate it
+    // internally.
+    switch (orientation) {
+      // Not supported on iOS as of 11/2021, but add it here just in case.
+      case ScreenOrientation.Orientation.PORTRAIT_DOWN:
+        return 180;
+      case ScreenOrientation.Orientation.LANDSCAPE_LEFT:
+        return cameraType === Camera.Constants.Type.front ? 270 : 90;
+      case ScreenOrientation.Orientation.LANDSCAPE_RIGHT:
+        return cameraType === Camera.Constants.Type.front ? 90 : 270;
+      default:
+        return 0;
     }
+  };
+
+  if (!tfReady) {
+    return (
+      <View style={styles.loadingMsg}>
+        <Text>Loading...</Text>
+      </View>
+    );
+  } else {
+    return (
+      // Note that you don't need to specify `cameraTextureWidth` and
+      // `cameraTextureHeight` prop in `TensorCamera` below.
+      <View
+        style={
+          isPortrait() ? styles.containerPortrait : styles.containerLandscape
+        }
+      >
+        <TensorCamera
+          ref={cameraRef}
+          style={styles.camera}
+          autorender={AUTO_RENDER}
+          type={cameraType}
+          // tensor related props
+          resizeWidth={getOutputTensorWidth()}
+          resizeHeight={getOutputTensorHeight()}
+          resizeDepth={3}
+          rotation={getTextureRotationAngleInDegrees()}
+          onReady={handleCameraStream}
+        />
+        {renderPose()}
+        {renderFps()}
+        {renderCameraTypeSwitcher()}
+      </View>
+    );
   }
-
-  /**
-   * TensorCamera가 특정 시간 마다 루프를 돌면서 측정된 값을 반환 해줌.
-   * @param images : 카메라 이미지를 나타내는 텐서를 생성
-   * @param updatePreview : WebGL 렌더 버퍼를 카메라의 내용으로 업데이트하는 함수
-   * @param gl : 렌더링을 수행하는 데 사용되는 ExpoWebGl 컨텍스트
-   */
-  const fn_onReadyTensorCamera = (images, updatePreview, gl) => {
-
-    const loop = async () => {
-
-      // TensorCamera에서 루프를 돌면서 나온 텐서 이미지 
-      const nextImageTensor = images.next().value;
-
-      // blazeFace 모델을 통하여 얼굴 측정
-      await fn_estimateBlazeFace(nextImageTensor)
-        .then((isEstimate) => {
-          console.log("얼굴을 예측하였는가?", isEstimate);
-        })
-        .catch((error) => {
-          console.log(error);
-        })
-      // 2초간 반복적으로 루프를 반복한다.
-      setTimeout(() => {
-        requestAnimationFrame(loop);
-      }, 2000);
-    }
-    loop();
-  }
-
-  return (
-    <View style={styles.container}>
-      {
-        isTfReady ?
-          <>
-            <TensorCamera
-              ref={tensorCameraRef} // 엘리먼트 정보 
-              style={styles.camera} // 스타일 
-              type={Camera.Constants.Type.front}  // 카메라의 앞, 뒤 방향
-              cameraTextureHeight={textureDims.height}  // 카메라 미리 보기 높이 값
-              cameraTextureWidth={textureDims.width}  // 카메라 미리 보기 너비 값
-              resizeHeight={CAMERA_SIZE.height} // 출력 카메라 높이
-              resizeWidth={CAMERA_SIZE.width}   // 출력 카메라 너비 
-              resizeDepth={3} // 출력 텐서의 깊이(채널 수)값. (3 or 4)
-              autorender={true} // 뷰가 카메라 내용으로 자동업데이트 되는지 여부. (렌더링 발생시 직접적 제어를 원하면 false 값으로 설정할 것)
-              useCustomShadersToResize={false} // 커스텀 셰이더를 사용하여 출력 텐서에 맞는 더 작은 치수로 카메라 이미지의 크기를 조정할지 여부.
-              onReady={fn_onReadyTensorCamera} // 컴포넌트가 마운트되고 준비되면 이 콜백이 호출되고 다음 3가지 요소를 받습니다.
-            />
-
-            {/* TensorCamera위에 그려줄 Canvas */}
-            <Canvas style={styles.canvas} ref={canvasRef} />
-          </>
-          :
-          <></>
-      }
-    </View>
-  );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: "#fff",
-    alignItems: "center",
-    justifyContent: "center",
+  containerPortrait: {
+    position: 'relative',
+    width: CAM_PREVIEW_WIDTH,
+    height: CAM_PREVIEW_HEIGHT,
+    marginTop: Dimensions.get('window').height / 2 - CAM_PREVIEW_HEIGHT / 2,
+  },
+  containerLandscape: {
+    position: 'relative',
+    width: CAM_PREVIEW_HEIGHT,
+    height: CAM_PREVIEW_WIDTH,
+    marginLeft: Dimensions.get('window').height / 2 - CAM_PREVIEW_HEIGHT / 2,
+  },
+  loadingMsg: {
+    position: 'absolute',
+    width: '100%',
+    height: '100%',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   camera: {
-    position: "absolute",
-    width: 320,
-    height: 480,
+    width: '100%',
+    height: '100%',
+    zIndex: 1,
   },
-  canvas: {
-    position: "absolute",
-    zIndex: 1000000,
-  }
+  svg: {
+    width: '100%',
+    height: '100%',
+    position: 'absolute',
+    zIndex: 30,
+  },
+  fpsContainer: {
+    position: 'absolute',
+    top: 10,
+    left: 10,
+    width: 80,
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, .7)',
+    borderRadius: 2,
+    padding: 8,
+    zIndex: 20,
+  },
+  cameraTypeSwitcher: {
+    position: 'absolute',
+    top: 10,
+    right: 10,
+    width: 180,
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, .7)',
+    borderRadius: 2,
+    padding: 8,
+    zIndex: 20,
+  },
 });
